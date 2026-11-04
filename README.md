@@ -25,7 +25,7 @@ swiftc -O DeskWidgets.swift -o DeskWidgets
 ./DeskWidgets
 ```
 
-Aparece un icono en la barra de menús con **Refresh** y **Quit**. Arrastra los widgets con el ratón para moverlos.
+Aparece un icono en la barra de menús con **Refresh** y **Quit**. Arrastra los widgets con el ratón para moverlos. Haz clic en un widget o en una fila para abrir su página (uso de Claude, perfil, repo, PR, corrida de CI o servidor local).
 
 Para que arranque al iniciar sesión, copia el binario a una ruta fija, por ejemplo `~/bin/DeskWidgets`, y agrégalo en **Ajustes del Sistema → General → Ítems de inicio**.
 

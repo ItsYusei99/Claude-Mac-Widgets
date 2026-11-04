@@ -27,6 +27,15 @@ func inText(_ d: Date) -> String {
     let s = max(0, Int(d.timeIntervalSinceNow)); return s >= 3600 ? "in \(s/3600) hr \(s%3600/60) min" : "in \(s/60) min"
 }
 
+func openLink(_ s: String) { if !s.isEmpty, let u = URL(string: s) { NSWorkspace.shared.open(u) } }
+// git remote (ssh or https) -> GitHub web URL; falls back to the local folder
+func webURL(_ p: String) -> String {
+    var r = sh("git remote get-url origin", cwd: p).trimmingCharacters(in: .whitespacesAndNewlines)
+    if r.hasPrefix("git@") { r = "https://" + r.dropFirst(4).replacingOccurrences(of: ":", with: "/") }
+    if r.hasSuffix(".git") { r = String(r.dropLast(4)) }
+    return r.hasPrefix("http") ? r : URL(fileURLWithPath: p).absoluteString
+}
+
 // MARK: - Config
 struct Config {
     var fiveHourCap = 3_000_000.0   // tokens (input+output+cache writes) per 5h block
@@ -51,9 +60,9 @@ struct Config {
 
 // MARK: - Models
 struct Usage { var fiveH = 0.0, week = 0.0, blockEnd: Date?, weekEnd: Date?, fiveTokens = 0.0, weekTokens = 0.0, exactWeek = false }
-struct RepoInfo: Identifiable { let id = UUID(); var name, branch: String; var dirty = 0, ahead = 0, behind = 0 }
-struct PR: Identifiable { let id = UUID(); var title, repo: String; var number: Int; var date: Date }
-struct Run: Identifiable { let id = UUID(); var name, repo, branch, state: String; var date: Date }
+struct RepoInfo: Identifiable { let id = UUID(); var name, branch: String; var dirty = 0, ahead = 0, behind = 0; var url = "" }
+struct PR: Identifiable { let id = UUID(); var title, repo: String; var number: Int; var date: Date; var url = "" }
+struct Run: Identifiable { let id = UUID(); var name, repo, branch, state: String; var date: Date; var url = "" }
 struct Server: Identifiable { let id = UUID(); var name, cmd: String; var port: Int }
 
 // MARK: - Providers
@@ -97,15 +106,39 @@ func loadUsage(_ cfg: Config) -> Usage {
 
 
 // Real limits: token read from the login Keychain by this app only, sent only to api.anthropic.com
+var usageExpired = false
+var usageCache: (Double, Date?, Double, Date?)?
+var usageNextTry = Date.distantPast
 func fetchRealUsage() -> (Double, Date?, Double, Date?)? {
+    // API rate-limits (429): poll at most every 5 min, back off 15 min on failure, keep last good value
+    if Date() < usageNextTry { return usageCache }
+    usageNextTry = Date().addingTimeInterval(300)
+    let path = NSHomeDirectory() + "/.config/desk-widgets/last-usage.json"
+    if usageCache == nil, let t = try? String(contentsOfFile: path, encoding: .utf8), let j = json(t) as? [String: Double] {
+        usageCache = (j["f"] ?? 0, j["fr"].map { Date(timeIntervalSince1970: $0) }, j["w"] ?? 0, j["wr"].map { Date(timeIntervalSince1970: $0) })
+    }
+    if let r = fetchRealUsageNow() {
+        usageCache = r
+        var j: [String: Double] = ["f": r.0, "w": r.2]
+        if let d = r.1 { j["fr"] = d.timeIntervalSince1970 }; if let d = r.3 { j["wr"] = d.timeIntervalSince1970 }
+        if let d = try? JSONSerialization.data(withJSONObject: j) { try? d.write(to: URL(fileURLWithPath: path)) }
+        return r
+    }
+    usageNextTry = Date().addingTimeInterval(usageExpired ? 60 : 900)
+    return usageCache
+}
+func fetchRealUsageNow() -> (Double, Date?, Double, Date?)? {
     let raw = sh("security find-generic-password -s 'Claude Code-credentials' -w 2>/dev/null").trimmingCharacters(in: .whitespacesAndNewlines)
-    guard let j = json(raw) as? [String: Any], let tok = (j["claudeAiOauth"] as? [String: Any])?["accessToken"] as? String else { return nil }
+    func log(_ m: String) { try? m.write(toFile: "/tmp/dw-usage.log", atomically: true, encoding: .utf8) }
+    guard let j = json(raw) as? [String: Any], let tok = (j["claudeAiOauth"] as? [String: Any])?["accessToken"] as? String else { log("no token from keychain (len \(raw.count))"); return nil }
     var req = URLRequest(url: URL(string: "https://api.anthropic.com/api/oauth/usage")!)
     req.setValue("Bearer \(tok)", forHTTPHeaderField: "Authorization")
     req.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
     req.timeoutInterval = 15
     let sem = DispatchSemaphore(value: 0); var data: Data?
-    URLSession.shared.dataTask(with: req) { d, r, _ in if (r as? HTTPURLResponse)?.statusCode == 200 { data = d }; sem.signal() }.resume()
+    URLSession.shared.dataTask(with: req) { d, r, e in
+        let c = (r as? HTTPURLResponse)?.statusCode ?? -1; log("http \(c) err \(e?.localizedDescription ?? "-") body \(String(data: d ?? Data(), encoding: .utf8)?.prefix(300) ?? "")")
+        usageExpired = (c == 401); if c == 200 { data = d }; sem.signal() }.resume()
     sem.wait()
     guard let d = data, let o = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
           let f = o["five_hour"] as? [String: Any], let w = o["seven_day"] as? [String: Any] else { return nil }
@@ -127,7 +160,7 @@ func findRepos(_ cfg: Config) -> [String] {
 func loadGit(_ repos: [String]) -> [RepoInfo] {
     repos.prefix(3).map { p in
         let lines = sh("git status -sb", cwd: p).split(separator: "\n").map(String.init)
-        var r = RepoInfo(name: (p as NSString).lastPathComponent, branch: "?")
+        var r = RepoInfo(name: (p as NSString).lastPathComponent, branch: "?", url: webURL(p))
         guard let h = lines.first else { return r }
         let head = h.dropFirst(3)
         r.branch = String(head.split(separator: ".").first ?? "?").trimmingCharacters(in: .whitespaces)
@@ -139,22 +172,22 @@ func loadGit(_ repos: [String]) -> [RepoInfo] {
 }
 
 func loadPRs() -> [PR] {
-    guard let a = json(sh("gh search prs --review-requested=@me --state=open -L 5 --json title,repository,number,updatedAt")) as? [[String: Any]] else { return [] }
+    guard let a = json(sh("gh search prs --review-requested=@me --state=open -L 5 --json title,repository,number,updatedAt,url")) as? [[String: Any]] else { return [] }
     return a.compactMap { o in
         guard let t = o["title"] as? String, let n = o["number"] as? Int else { return nil }
         let repo = ((o["repository"] as? [String: Any])?["name"] as? String) ?? ""
-        return PR(title: t, repo: repo, number: n, date: (o["updatedAt"] as? String).flatMap(parseDate) ?? Date())
+        return PR(title: t, repo: repo, number: n, date: (o["updatedAt"] as? String).flatMap(parseDate) ?? Date(), url: o["url"] as? String ?? "")
     }
 }
 
 func loadRuns(_ repos: [String]) -> [Run] {
     var all: [Run] = []
     for p in repos.prefix(4) {
-        guard let a = json(sh("gh run list -L 3 --json name,status,conclusion,headBranch,updatedAt", cwd: p)) as? [[String: Any]] else { continue }
+        guard let a = json(sh("gh run list -L 3 --json name,status,conclusion,headBranch,updatedAt,url", cwd: p)) as? [[String: Any]] else { continue }
         for o in a {
             let st = (o["status"] as? String) == "completed" ? ((o["conclusion"] as? String) ?? "") : "running"
             all.append(Run(name: o["name"] as? String ?? "", repo: (p as NSString).lastPathComponent, branch: o["headBranch"] as? String ?? "",
-                           state: st, date: (o["updatedAt"] as? String).flatMap(parseDate) ?? Date()))
+                           state: st, date: (o["updatedAt"] as? String).flatMap(parseDate) ?? Date(), url: o["url"] as? String ?? ""))
         }
     }
     return Array(all.sorted { $0.date > $1.date }.prefix(3))
@@ -187,22 +220,23 @@ func loadContrib() -> (Int, [[Int]]) {
 @MainActor final class Store: ObservableObject {
     @Published var usage = Usage(); @Published var repos: [RepoInfo] = []; @Published var prs: [PR] = []
     @Published var runs: [Run] = []; @Published var servers: [Server] = []
-    @Published var total = 0; @Published var grid: [[Int]] = []; @Published var updated = Date()
+    @Published var total = 0; @Published var grid: [[Int]] = []; @Published var updated = Date(); @Published var login = ""
     var cfg = Config.load()
     func refresh() {
         let cfg = Config.load(); self.cfg = cfg
         Task.detached { [self] in
             let repos = findRepos(cfg)
+            let login = sh("gh api user --jq .login").trimmingCharacters(in: .whitespacesAndNewlines)
             async let u = loadUsage(cfg), g = loadGit(repos), p = loadPRs(), r = loadRuns(repos), s = loadServers(), c = loadContrib()
             let (u1, g1, p1, r1, s1, c1) = await (u, g, p, r, s, c)
-            await MainActor.run { usage = u1; self.repos = g1; prs = p1; runs = r1; servers = s1; total = c1.0; grid = c1.1; updated = Date() }
+            await MainActor.run { usage = u1; self.repos = g1; prs = p1; runs = r1; servers = s1; total = c1.0; grid = c1.1; updated = Date(); self.login = login }
         }
     }
 }
 
 // MARK: - Views
 struct Card<C: View>: View {
-    let title: String, icon: String, tint: Color; var trailing = ""; @ViewBuilder var content: C
+    let title: String, icon: String, tint: Color; var trailing = ""; var link = ""; @ViewBuilder var content: C
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack {
@@ -217,6 +251,7 @@ struct Card<C: View>: View {
         .padding(16).frame(width: 330, height: 190, alignment: .topLeading)
         .background(RoundedRectangle(cornerRadius: 24).fill(Color(white: 0.06, opacity: 0.92)))
         .overlay(RoundedRectangle(cornerRadius: 24).stroke(Color.white.opacity(0.08)))
+        .contentShape(RoundedRectangle(cornerRadius: 24)).onTapGesture { openLink(link) }
     }
 }
 struct Meter: View {
@@ -280,7 +315,7 @@ struct ClaudeCard: View {
                 Text(plan).font(.system(size: 10, weight: .semibold)).padding(.horizontal, 7).padding(.vertical, 2)
                     .background(Capsule().fill(claudeCoral.opacity(0.22))).foregroundStyle(claudeCoral)
                 Spacer()
-                Text(ago(updated)).font(.system(size: 11)).foregroundStyle(.secondary)
+                Text(usageExpired ? "run claude to sign in" : ago(updated)).font(.system(size: 11)).foregroundStyle(usageExpired ? .orange : .secondary)
             }
             HStack(alignment: .top, spacing: 8) {
                 Ring(label: "5 hours", pct: u.fiveH, sub: reset(u.blockEnd, long: false))
@@ -291,6 +326,7 @@ struct ClaudeCard: View {
         .padding(16).frame(width: 330, height: 190, alignment: .topLeading)
         .background(RoundedRectangle(cornerRadius: 24).fill(LinearGradient(colors: [Color(red: 0.13, green: 0.09, blue: 0.08, opacity: 0.94), Color(white: 0.06, opacity: 0.94)], startPoint: .topLeading, endPoint: .bottomTrailing)))
         .overlay(RoundedRectangle(cornerRadius: 24).stroke(claudeCoral.opacity(0.25)))
+        .contentShape(RoundedRectangle(cornerRadius: 24)).onTapGesture { openLink("https://claude.ai/settings/usage") }
     }
 }
 struct Dot: View { let c: Color; var body: some View { Circle().fill(c).frame(width: 9, height: 9) } }
@@ -303,30 +339,33 @@ struct Dashboard: View {
         VStack(spacing: 14) {
             HStack(spacing: 14) {
                 ClaudeCard(plan: s.cfg.plan, updated: s.updated, u: u)
-                Card(title: "GIT", icon: "arrow.triangle.branch", tint: .orange) {
+                Card(title: "GIT", icon: "arrow.triangle.branch", tint: .orange, link: s.login.isEmpty ? "" : "https://github.com/\(s.login)"+"?tab=repositories") {
                     ForEach(s.repos) { r in
                         HStack { VStack(alignment: .leading) { Text(r.name).font(.system(size: 14, weight: .medium)); Text(r.branch).font(.system(size: 11)).foregroundStyle(.secondary) }
                             Spacer()
                             if r.dirty == 0 && r.ahead == 0 && r.behind == 0 { Text("Up to date").foregroundStyle(.green).font(.system(size: 12)) }
                             else { Text("✎\(r.dirty) ↑\(r.ahead) ↓\(r.behind)").font(.system(size: 12)).foregroundStyle(.orange) } }
+                        .contentShape(Rectangle()).onTapGesture { openLink(r.url) }
                     }
                 }
             }
             HStack(spacing: 14) {
-                Card(title: "GITHUB", icon: "arrow.triangle.pull", tint: .indigo, trailing: "\(s.prs.count) to review") {
+                Card(title: "GITHUB", icon: "arrow.triangle.pull", tint: .indigo, trailing: "\(s.prs.count) to review", link: "https://github.com/pulls/review-requested") {
                     if s.prs.isEmpty { Text("Nothing to review").foregroundStyle(.secondary) }
                     ForEach(s.prs.prefix(3)) { p in
                         VStack(alignment: .leading) { Text(p.title).font(.system(size: 13, weight: .medium)).lineLimit(1)
                             Text("\(ago(p.date)) · \(p.repo)#\(p.number)").font(.system(size: 11)).foregroundStyle(.secondary) }
+                        .contentShape(Rectangle()).onTapGesture { openLink(p.url) }
                     }
                 }
-                Card(title: "GITHUB ACTIONS", icon: "play.circle", tint: .indigo) {
+                Card(title: "GITHUB ACTIONS", icon: "play.circle", tint: .indigo, link: s.repos.first.map { $0.url.hasPrefix("http") ? $0.url + "/actions" : "" } ?? "") {
                     if s.runs.isEmpty { Text("No runs").foregroundStyle(.secondary) }
                     ForEach(s.runs) { r in
                         HStack(spacing: 8) { Dot(c: stateColor(r.state))
                             VStack(alignment: .leading) { Text(r.name).font(.system(size: 13, weight: .medium)).lineLimit(1)
                                 Text("\(r.repo) · \(r.branch)").font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1) }
                             Spacer(); Text(r.state == "running" ? "Running" : ago(r.date)).font(.system(size: 11)).foregroundStyle(stateColor(r.state)) }
+                        .contentShape(Rectangle()).onTapGesture { openLink(r.url) }
                     }
                 }
             }
@@ -336,9 +375,10 @@ struct Dashboard: View {
                     ForEach(s.servers) { v in
                         HStack { VStack(alignment: .leading) { Text(v.name).font(.system(size: 13, weight: .medium)); Text(v.cmd).font(.system(size: 11, design: .monospaced)).foregroundStyle(.secondary) }
                             Spacer(); Text(":\(v.port)").font(.system(size: 12, design: .monospaced)).foregroundStyle(.green) }
+                        .contentShape(Rectangle()).onTapGesture { openLink("http://localhost:\(v.port)") }
                     }
                 }
-                Card(title: "\(s.total) contributions", icon: "square.grid.3x3.fill", tint: .green, trailing: "last year") {
+                Card(title: "\(s.total) contributions", icon: "square.grid.3x3.fill", tint: .green, trailing: "last year", link: s.login.isEmpty ? "" : "https://github.com/\(s.login)") {
                     HStack(spacing: 3) {
                         ForEach(Array(s.grid.enumerated()), id: \.offset) { _, w in
                             VStack(spacing: 3) { ForEach(Array(w.enumerated()), id: \.offset) { _, n in
