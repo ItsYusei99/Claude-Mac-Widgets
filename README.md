@@ -35,7 +35,7 @@ Para que arranque al iniciar sesión, copia el binario a una ruta fija, por ejem
 2. Ejecuta `claude` y haz `/login` con tu cuenta.
 3. Abre el widget. macOS pedirá permiso para leer `Claude Code-credentials` del Keychain: elige **Permitir**.
 
-La app lee el token localmente y lo envía únicamente a `api.anthropic.com` para consultar tu uso. No lo guarda ni lo envía a ningún otro sitio. Revisa el código en `fetchRealUsage()` antes de aceptar.
+La app lee el token localmente y lo envía únicamente a `api.anthropic.com` para consultar tu uso. Cuando el token vence, lo renueva con el refresh token (en `console.anthropic.com`) y guarda el nuevo en el mismo ítem del Keychain, igual que hace Claude Code. Nunca escribe tokens en logs. Revisa `refreshAccessToken()` y `fetchRealUsageNow()` antes de aceptar.
 
 Si no hay sesión o falla la consulta, el widget usa los valores manuales de abajo.
 

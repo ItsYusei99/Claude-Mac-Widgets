@@ -135,26 +135,88 @@ func fetchRealUsage() -> (Double, Date?, Double, Date?)? {
     usageNextTry = Date().addingTimeInterval(usageExpired ? 60 : max(900, usageRetryAfter))
     return usageCache
 }
+// Claude Code's login lives in the Keychain item below; it is read and written only through
+// /usr/bin/security (the same tool Claude Code uses) and tokens are never logged
+let credService = "Claude Code-credentials"
+let oauthClientID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+func usageLog(_ m: String) {
+    let line = "\(Date()) \(m)\n", path = "/tmp/dw-usage.log"
+    if let h = FileHandle(forWritingAtPath: path), (try? FileManager.default.attributesOfItem(atPath: path)[.size] as? Int ?? 0) ?? 0 < 20_000 {
+        h.seekToEndOfFile(); h.write(line.data(using: .utf8)!); h.closeFile()
+    } else { try? line.write(toFile: path, atomically: true, encoding: .utf8) }
+}
+func runTool(_ exe: String, _ args: [String]) -> (Int32, String) {
+    let p = Process(); p.executableURL = URL(fileURLWithPath: exe); p.arguments = args
+    let out = Pipe(); p.standardOutput = out; p.standardError = Pipe()
+    do { try p.run() } catch { return (-1, "") }
+    let d = out.fileHandleForReading.readDataToEndOfFile(); p.waitUntilExit()
+    return (p.terminationStatus, String(data: d, encoding: .utf8) ?? "")
+}
+func readCreds() -> (acct: String, root: [String: Any])? {
+    let (c, raw) = runTool("/usr/bin/security", ["find-generic-password", "-s", credService, "-w"])
+    guard c == 0, let root = json(raw.trimmingCharacters(in: .whitespacesAndNewlines)) as? [String: Any] else { return nil }
+    let (_, attrs) = runTool("/usr/bin/security", ["find-generic-password", "-s", credService])
+    let acct = attrs.split(separator: "\n").first { $0.contains("\"acct\"") }
+        .flatMap { l in l.range(of: #"="(.*)"$"#, options: .regularExpression).map { String(l[$0].dropFirst(2).dropLast()) } } ?? ""
+    return (acct, root)
+}
+func post(_ url: String, _ body: [String: Any]) -> (Int, [String: Any]?) {
+    var req = URLRequest(url: URL(string: url)!); req.httpMethod = "POST"; req.timeoutInterval = 15
+    req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    req.httpBody = try? JSONSerialization.data(withJSONObject: body)
+    let sem = DispatchSemaphore(value: 0); var code = -1; var obj: [String: Any]?
+    URLSession.shared.dataTask(with: req) { d, r, _ in
+        code = (r as? HTTPURLResponse)?.statusCode ?? -1
+        obj = d.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }; sem.signal() }.resume()
+    sem.wait(); return (code, obj)
+}
+// Trade the refresh token for a new access token and save it back so Claude Code keeps working too
+func refreshAccessToken() -> String? {
+    guard let (acct, root) = readCreds(), !acct.isEmpty, var o = root["claudeAiOauth"] as? [String: Any],
+          let rt = o["refreshToken"] as? String else { usageLog("refresh: no refresh token in keychain"); return nil }
+    let (c, r) = post("https://console.anthropic.com/v1/oauth/token", ["grant_type": "refresh_token", "refresh_token": rt, "client_id": oauthClientID])
+    guard c == 200, let r, let at = r["access_token"] as? String else {
+        usageLog("refresh: http \(c) \((r?["error"] as? String) ?? "")"); return nil }
+    o["accessToken"] = at
+    if let nrt = r["refresh_token"] as? String { o["refreshToken"] = nrt }
+    if let exp = r["expires_in"] as? Double { o["expiresAt"] = Int((Date().timeIntervalSince1970 + exp) * 1000) }
+    var newRoot = root; newRoot["claudeAiOauth"] = o
+    guard let d = try? JSONSerialization.data(withJSONObject: newRoot), let str = String(data: d, encoding: .utf8) else { return at }
+    let (w, _) = runTool("/usr/bin/security", ["add-generic-password", "-U", "-a", acct, "-s", credService, "-w", str])
+    usageLog(w == 0 ? "refresh: ok, saved to keychain" : "refresh: ok but keychain write failed (\(w)); run claude and /login")
+    return at
+}
+func currentAccessToken() -> String? {
+    guard let (_, root) = readCreds(), let o = root["claudeAiOauth"] as? [String: Any], let at = o["accessToken"] as? String else {
+        usageLog("no token in keychain"); return nil }
+    // refresh 5 min before expiry
+    if let exp = o["expiresAt"] as? Double, exp / 1000 < Date().timeIntervalSince1970 + 300 { return refreshAccessToken() ?? at }
+    return at
+}
 func fetchRealUsageNow() -> (Double, Date?, Double, Date?)? {
-    let raw = sh("security find-generic-password -s 'Claude Code-credentials' -w 2>/dev/null").trimmingCharacters(in: .whitespacesAndNewlines)
-    func log(_ m: String) { try? m.write(toFile: "/tmp/dw-usage.log", atomically: true, encoding: .utf8) }
-    guard let j = json(raw) as? [String: Any], let tok = (j["claudeAiOauth"] as? [String: Any])?["accessToken"] as? String else { log("no token from keychain (len \(raw.count))"); return nil }
-    var req = URLRequest(url: URL(string: "https://api.anthropic.com/api/oauth/usage")!)
-    req.setValue("Bearer \(tok)", forHTTPHeaderField: "Authorization")
-    req.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
-    req.setValue("ClaudeMacWidgets/1.0", forHTTPHeaderField: "User-Agent")
-    req.timeoutInterval = 15
-    let sem = DispatchSemaphore(value: 0); var data: Data?
-    URLSession.shared.dataTask(with: req) { d, r, e in
-        let h = r as? HTTPURLResponse, c = h?.statusCode ?? -1
-        let ra = h?.value(forHTTPHeaderField: "Retry-After") ?? "-"
-        log("\(Date()) http \(c) retry-after \(ra) err \(e?.localizedDescription ?? "-") body \(String(data: d ?? Data(), encoding: .utf8)?.prefix(300) ?? "")")
-        usageExpired = (c == 401); usageRateLimited = (c == 429); usageRetryAfter = Double(ra) ?? 0; if c == 200 { data = d }; sem.signal() }.resume()
-    sem.wait()
-    guard let d = data, let o = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
-          let f = o["five_hour"] as? [String: Any], let w = o["seven_day"] as? [String: Any] else { return nil }
-    func dt(_ x: [String: Any]) -> Date? { (x["resets_at"] as? String).flatMap(parseDate) }
-    return ((f["utilization"] as? Double) ?? 0, dt(f), (w["utilization"] as? Double) ?? 0, dt(w))
+    guard var tok = currentAccessToken() else { return nil }
+    for attempt in 0..<2 {
+        var req = URLRequest(url: URL(string: "https://api.anthropic.com/api/oauth/usage")!)
+        req.setValue("Bearer \(tok)", forHTTPHeaderField: "Authorization")
+        req.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
+        req.setValue("ClaudeMacWidgets/1.0", forHTTPHeaderField: "User-Agent")
+        req.timeoutInterval = 15
+        let sem = DispatchSemaphore(value: 0); var data: Data?; var c = -1
+        URLSession.shared.dataTask(with: req) { d, r, e in
+            let h = r as? HTTPURLResponse; c = h?.statusCode ?? -1
+            let ra = h?.value(forHTTPHeaderField: "Retry-After") ?? "-"
+            usageLog("usage: http \(c) retry-after \(ra) \(e?.localizedDescription ?? "")")
+            usageRateLimited = (c == 429); usageRetryAfter = Double(ra) ?? 0
+            if c == 200 { data = d }; sem.signal() }.resume()
+        sem.wait()
+        if c == 401, attempt == 0, let t = refreshAccessToken() { tok = t; continue }
+        usageExpired = (c == 401)
+        guard let d = data, let o = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
+              let f = o["five_hour"] as? [String: Any], let w = o["seven_day"] as? [String: Any] else { return nil }
+        func dt(_ x: [String: Any]) -> Date? { (x["resets_at"] as? String).flatMap(parseDate) }
+        return ((f["utilization"] as? Double) ?? 0, dt(f), (w["utilization"] as? Double) ?? 0, dt(w))
+    }
+    return nil
 }
 
 func findRepos(_ cfg: Config) -> [String] {
