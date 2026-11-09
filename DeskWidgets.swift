@@ -186,11 +186,22 @@ func refreshAccessToken() -> String? {
     usageLog(w == 0 ? "refresh: ok, saved to keychain" : "refresh: ok but keychain write failed (\(w)); run claude and /login")
     return at
 }
+// Last resort when the widget can't refresh on its own: run refresh-claude.sh (next to the binary),
+// which opens claude once so it renews its own login, then read the Keychain again. At most every 30 min.
+var lastClaudeRun = Date.distantPast
+func refreshViaClaude() -> String? {
+    guard Date().timeIntervalSince(lastClaudeRun) > 1800 else { return nil }
+    lastClaudeRun = Date()
+    let script = (CommandLine.arguments[0] as NSString).deletingLastPathComponent + "/refresh-claude.sh"
+    guard FileManager.default.isExecutableFile(atPath: script) else { usageLog("refresh-claude.sh not found"); return nil }
+    _ = runTool(script, [])
+    return (readCreds()?.root["claudeAiOauth"] as? [String: Any])?["accessToken"] as? String
+}
 func currentAccessToken() -> String? {
     guard let (_, root) = readCreds(), let o = root["claudeAiOauth"] as? [String: Any], let at = o["accessToken"] as? String else {
         usageLog("no token in keychain"); return nil }
     // refresh 5 min before expiry
-    if let exp = o["expiresAt"] as? Double, exp / 1000 < Date().timeIntervalSince1970 + 300 { return refreshAccessToken() ?? at }
+    if let exp = o["expiresAt"] as? Double, exp / 1000 < Date().timeIntervalSince1970 + 300 { return refreshAccessToken() ?? refreshViaClaude() ?? at }
     return at
 }
 func fetchRealUsageNow() -> (Double, Date?, Double, Date?)? {
@@ -209,7 +220,7 @@ func fetchRealUsageNow() -> (Double, Date?, Double, Date?)? {
             usageRateLimited = (c == 429); usageRetryAfter = Double(ra) ?? 0
             if c == 200 { data = d }; sem.signal() }.resume()
         sem.wait()
-        if c == 401, attempt == 0, let t = refreshAccessToken() { tok = t; continue }
+        if c == 401, attempt == 0, let t = refreshAccessToken() ?? refreshViaClaude() { tok = t; continue }
         usageExpired = (c == 401)
         guard let d = data, let o = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
               let f = o["five_hour"] as? [String: Any], let w = o["seven_day"] as? [String: Any] else { return nil }

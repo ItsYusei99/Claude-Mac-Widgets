@@ -37,6 +37,8 @@ Para que arranque al iniciar sesión, copia el binario a una ruta fija, por ejem
 
 La app lee el token localmente y lo envía únicamente a `api.anthropic.com` para consultar tu uso. Cuando el token vence, lo renueva con el refresh token (en `console.anthropic.com`) y guarda el nuevo en el mismo ítem del Keychain, igual que hace Claude Code. Nunca escribe tokens en logs. Revisa `refreshAccessToken()` y `fetchRealUsageNow()` antes de aceptar.
 
+Si el widget no logra renovar el token por su cuenta, ejecuta `refresh-claude.sh` (junto al binario) como máximo cada 30 minutos. Ese script abre `claude -p` una vez con Haiku y sin `ANTHROPIC_API_KEY`, para que Claude Code renueve su propio login, y se cierra solo (límite de 90 s). Gasta una cantidad mínima de tu suscripción.
+
 Si no hay sesión o falla la consulta, el widget usa los valores manuales de abajo.
 
 ## Configuración opcional
