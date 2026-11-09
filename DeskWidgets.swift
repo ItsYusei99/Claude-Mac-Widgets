@@ -59,7 +59,7 @@ struct Config {
 }
 
 // MARK: - Models
-struct Usage { var fiveH = 0.0, week = 0.0, blockEnd: Date?, weekEnd: Date?, fiveTokens = 0.0, weekTokens = 0.0, exactWeek = false }
+struct Usage { var fiveH = 0.0, week = 0.0, blockEnd: Date?, weekEnd: Date?, fiveTokens = 0.0, weekTokens = 0.0, exactWeek = false, fiveKnown = true, weekKnown = true }
 struct RepoInfo: Identifiable { let id = UUID(); var name, branch: String; var dirty = 0, ahead = 0, behind = 0; var url = "" }
 struct PR: Identifiable { let id = UUID(); var title, repo: String; var number: Int; var date: Date; var url = "" }
 struct Run: Identifiable { let id = UUID(); var name, repo, branch, state: String; var date: Date; var url = "" }
@@ -100,7 +100,13 @@ func loadUsage(_ cfg: Config) -> Usage {
     r.week = r.weekTokens / cfg.weekCap * 100
     if let p = cfg.fivePct, let t = cfg.fiveReset, t > Date() { r.fiveH = p; r.blockEnd = t }
     if let p = cfg.weekPct, let t = cfg.weekReset, t > Date() { r.week = p; r.weekEnd = t; r.exactWeek = true }
-    if let (fp, fr, wp, wr) = fetchRealUsage() { r.fiveH = fp; r.blockEnd = fr; r.week = wp; r.weekEnd = wr; r.exactWeek = true }
+    if let (fp, fr, wp, wr) = fetchRealUsage() {
+        // a cached window whose reset already passed is unknown until the API answers again
+        let now = Date()
+        r.fiveKnown = fr.map { $0 > now } ?? true; r.weekKnown = wr.map { $0 > now } ?? true
+        r.fiveH = r.fiveKnown ? fp : 0; r.blockEnd = r.fiveKnown ? fr : nil
+        r.week = r.weekKnown ? wp : 0; r.weekEnd = r.weekKnown ? wr : nil; r.exactWeek = true
+    }
     return r
 }
 
@@ -109,22 +115,24 @@ func loadUsage(_ cfg: Config) -> Usage {
 var usageExpired = false
 var usageCache: (Double, Date?, Double, Date?)?
 var usageNextTry = Date.distantPast
+var usageFetchedAt: Date?, usageRateLimited = false, usageRetryAfter: TimeInterval = 0
 func fetchRealUsage() -> (Double, Date?, Double, Date?)? {
-    // API rate-limits (429): poll at most every 5 min, back off 15 min on failure, keep last good value
+    // API rate-limits (429): poll at most every 10 min, honor Retry-After, keep last good value
     if Date() < usageNextTry { return usageCache }
-    usageNextTry = Date().addingTimeInterval(300)
+    usageNextTry = Date().addingTimeInterval(600)
     let path = NSHomeDirectory() + "/.config/desk-widgets/last-usage.json"
     if usageCache == nil, let t = try? String(contentsOfFile: path, encoding: .utf8), let j = json(t) as? [String: Double] {
         usageCache = (j["f"] ?? 0, j["fr"].map { Date(timeIntervalSince1970: $0) }, j["w"] ?? 0, j["wr"].map { Date(timeIntervalSince1970: $0) })
+        usageFetchedAt = j["t"].map { Date(timeIntervalSince1970: $0) }
     }
     if let r = fetchRealUsageNow() {
-        usageCache = r
-        var j: [String: Double] = ["f": r.0, "w": r.2]
+        usageCache = r; usageFetchedAt = Date()
+        var j: [String: Double] = ["f": r.0, "w": r.2, "t": Date().timeIntervalSince1970]
         if let d = r.1 { j["fr"] = d.timeIntervalSince1970 }; if let d = r.3 { j["wr"] = d.timeIntervalSince1970 }
         if let d = try? JSONSerialization.data(withJSONObject: j) { try? d.write(to: URL(fileURLWithPath: path)) }
         return r
     }
-    usageNextTry = Date().addingTimeInterval(usageExpired ? 60 : 900)
+    usageNextTry = Date().addingTimeInterval(usageExpired ? 60 : max(900, usageRetryAfter))
     return usageCache
 }
 func fetchRealUsageNow() -> (Double, Date?, Double, Date?)? {
@@ -134,11 +142,14 @@ func fetchRealUsageNow() -> (Double, Date?, Double, Date?)? {
     var req = URLRequest(url: URL(string: "https://api.anthropic.com/api/oauth/usage")!)
     req.setValue("Bearer \(tok)", forHTTPHeaderField: "Authorization")
     req.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
+    req.setValue("ClaudeMacWidgets/1.0", forHTTPHeaderField: "User-Agent")
     req.timeoutInterval = 15
     let sem = DispatchSemaphore(value: 0); var data: Data?
     URLSession.shared.dataTask(with: req) { d, r, e in
-        let c = (r as? HTTPURLResponse)?.statusCode ?? -1; log("http \(c) err \(e?.localizedDescription ?? "-") body \(String(data: d ?? Data(), encoding: .utf8)?.prefix(300) ?? "")")
-        usageExpired = (c == 401); if c == 200 { data = d }; sem.signal() }.resume()
+        let h = r as? HTTPURLResponse, c = h?.statusCode ?? -1
+        let ra = h?.value(forHTTPHeaderField: "Retry-After") ?? "-"
+        log("\(Date()) http \(c) retry-after \(ra) err \(e?.localizedDescription ?? "-") body \(String(data: d ?? Data(), encoding: .utf8)?.prefix(300) ?? "")")
+        usageExpired = (c == 401); usageRateLimited = (c == 429); usageRetryAfter = Double(ra) ?? 0; if c == 200 { data = d }; sem.signal() }.resume()
     sem.wait()
     guard let d = data, let o = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
           let f = o["five_hour"] as? [String: Any], let w = o["seven_day"] as? [String: Any] else { return nil }
@@ -287,14 +298,14 @@ struct ClaudeLogo: View {
     var body: some View { ClaudeMark().stroke(claudeCoral, style: StrokeStyle(lineWidth: size * 0.13, lineCap: .round)).frame(width: size, height: size) }
 }
 struct Ring: View {
-    let label: String, pct: Double, sub: String
-    var color: Color { pct >= 90 ? Color(red: 0.92, green: 0.27, blue: 0.27) : pct >= 70 ? Color(red: 1.0, green: 0.58, blue: 0.2) : pct >= 40 ? Color(red: 0.98, green: 0.80, blue: 0.2) : Color(red: 0.3, green: 0.82, blue: 0.45) }
+    let label: String, pct: Double, sub: String; var known = true
+    var color: Color { !known ? .gray : pct >= 90 ? Color(red: 0.92, green: 0.27, blue: 0.27) : pct >= 70 ? Color(red: 1.0, green: 0.58, blue: 0.2) : pct >= 40 ? Color(red: 0.98, green: 0.80, blue: 0.2) : Color(red: 0.3, green: 0.82, blue: 0.45) }
     var body: some View {
         VStack(spacing: 6) {
             ZStack {
                 Circle().stroke(Color.white.opacity(0.1), lineWidth: 8)
                 Circle().trim(from: 0, to: min(1, pct / 100)).stroke(color, style: StrokeStyle(lineWidth: 8, lineCap: .round)).rotationEffect(.degrees(-90))
-                Text("\(Int(min(pct, 999)))%").font(.system(size: 18, weight: .bold, design: .rounded)).foregroundStyle(.white)
+                Text(known ? "\(Int(min(pct, 999)))%" : "—").font(.system(size: 18, weight: .bold, design: .rounded)).foregroundStyle(.white)
             }.frame(width: 72, height: 72)
             Text(label).font(.system(size: 12, weight: .semibold))
             Text(sub).font(.system(size: 10)).foregroundStyle(.secondary).multilineTextAlignment(.center).lineLimit(2)
@@ -303,6 +314,12 @@ struct Ring: View {
 }
 struct ClaudeCard: View {
     let plan: String, updated: Date, u: Usage
+    // age of the last real API answer, not of the widget refresh
+    var status: String {
+        if usageExpired { return "run claude to sign in" }
+        let age = usageFetchedAt.map(ago) ?? "never"
+        return usageRateLimited ? "rate limited · \(age)" : age
+    }
     func reset(_ d: Date?, long: Bool) -> String {
         guard let d else { return "No active block" }
         return long ? "Resets \(d.formatted(.dateTime.weekday().hour().minute()))" : "Resets \(d.formatted(date: .omitted, time: .shortened))\n\(inText(d))"
@@ -315,11 +332,11 @@ struct ClaudeCard: View {
                 Text(plan).font(.system(size: 10, weight: .semibold)).padding(.horizontal, 7).padding(.vertical, 2)
                     .background(Capsule().fill(claudeCoral.opacity(0.22))).foregroundStyle(claudeCoral)
                 Spacer()
-                Text(usageExpired ? "run claude to sign in" : ago(updated)).font(.system(size: 11)).foregroundStyle(usageExpired ? .orange : .secondary)
+                Text(status).font(.system(size: 11)).foregroundStyle(usageExpired || usageRateLimited ? .orange : .secondary)
             }
             HStack(alignment: .top, spacing: 8) {
-                Ring(label: "5 hours", pct: u.fiveH, sub: reset(u.blockEnd, long: false))
-                Ring(label: "This week", pct: u.week, sub: reset(u.weekEnd, long: true))
+                Ring(label: "5 hours", pct: u.fiveH, sub: u.fiveKnown ? reset(u.blockEnd, long: false) : "Waiting for data", known: u.fiveKnown)
+                Ring(label: "This week", pct: u.week, sub: u.weekKnown ? reset(u.weekEnd, long: true) : "Waiting for data", known: u.weekKnown)
             }
             Spacer(minLength: 0)
         }
