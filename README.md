@@ -27,7 +27,7 @@ swiftc -O DeskWidgets.swift -o DeskWidgets
 
 Aparece un icono en la barra de menús con **Refresh** y **Quit**. Arrastra los widgets con el ratón para moverlos. Haz clic en un widget o en una fila para abrir su página (uso de Claude, perfil, repo, PR, corrida de CI o servidor local).
 
-Para que arranque al iniciar sesión, copia el binario a una ruta fija, por ejemplo `~/bin/DeskWidgets`, y agrégalo en **Ajustes del Sistema → General → Ítems de inicio**.
+Para que arranque al iniciar sesión, ejecuta `./install-autostart.sh` (instala un LaunchAgent; si crashea se relanza, pero si lo cierras con Quit no vuelve hasta el próximo login). Para quitarlo: `launchctl bootout gui/$(id -u)/com.claudemacwidgets.deskwidgets` y borra `~/Library/LaunchAgents/com.claudemacwidgets.deskwidgets.plist`.
 
 ## Límites de Claude Code
 
